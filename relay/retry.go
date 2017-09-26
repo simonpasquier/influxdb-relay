@@ -67,6 +67,10 @@ func (r *retryBuffer) post(buf []byte, query string, auth string) (*responseData
 	return batch.resp, nil
 }
 
+func (r *retryBuffer) pendingBytes() int {
+	return r.list.size
+}
+
 func (r *retryBuffer) run() {
 	buf := bytes.NewBuffer(make([]byte, 0, r.maxBatch))
 	for {
@@ -141,6 +145,7 @@ func newBufferList(maxSize, maxBatch int) *bufferList {
 // pop will remove and return the first element of the list, blocking if necessary
 func (l *bufferList) pop() *batch {
 	l.cond.L.Lock()
+	defer l.cond.L.Unlock()
 
 	for l.size == 0 {
 		l.cond.Wait()
@@ -150,16 +155,14 @@ func (l *bufferList) pop() *batch {
 	l.head = l.head.next
 	l.size -= b.size
 
-	l.cond.L.Unlock()
-
 	return b
 }
 
 func (l *bufferList) add(buf []byte, query string, auth string) (*batch, error) {
 	l.cond.L.Lock()
+	defer l.cond.L.Unlock()
 
 	if l.size+len(buf) > l.maxSize {
-		l.cond.L.Unlock()
 		return nil, ErrBufferFull
 	}
 
@@ -195,6 +198,5 @@ func (l *bufferList) add(buf []byte, query string, auth string) (*batch, error) 
 		b.bufs = append(b.bufs, buf)
 	}
 
-	l.cond.L.Unlock()
 	return *cur, nil
 }

@@ -3,15 +3,22 @@ package main
 import (
 	"flag"
 	"fmt"
+	"net/http"
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 
 	"github.com/influxdata/influxdb-relay/relay"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 var (
 	configFile = flag.String("config", "", "Configuration file to use")
+)
+
+const (
+	DefaultMetricsPath = "/metrics"
 )
 
 func main() {
@@ -31,6 +38,21 @@ func main() {
 	r, err := relay.New(cfg)
 	if err != nil {
 		log.Fatal(err)
+	}
+
+	if cfg.TelemetryEnabled() {
+		path := cfg.Telemetry.Path
+		if path == "" {
+			path = DefaultMetricsPath
+		}
+		if !strings.HasPrefix(path, "/") {
+			path = "/" + path
+		}
+		log.Printf("starting telemetry on %s%s", cfg.Telemetry.Addr, path)
+		go func() {
+			http.Handle(path, promhttp.Handler())
+			log.Fatal(http.ListenAndServe(cfg.Telemetry.Addr, nil))
+		}()
 	}
 
 	sigChan := make(chan os.Signal, 1)

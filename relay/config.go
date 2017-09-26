@@ -9,6 +9,7 @@ import (
 type Config struct {
 	HTTPRelays []HTTPConfig `toml:"http"`
 	UDPRelays  []UDPConfig  `toml:"udp"`
+	Telemetry  TelemetryConfig  `toml:"telemetry"`
 }
 
 type HTTPConfig struct {
@@ -82,6 +83,14 @@ type UDPOutputConfig struct {
 	MTU int `toml:"mtu"`
 }
 
+type TelemetryConfig struct {
+	// Address:port where the telemetry server will listen
+	Addr string `toml:"bind-addr"`
+
+	// Path where the telemetry server will serve the metrics
+	Path string `toml:"path"`
+}
+
 // LoadConfigFile parses the specified file into a Config object
 func LoadConfigFile(filename string) (cfg Config, err error) {
 	f, err := os.Open(filename)
@@ -91,4 +100,8 @@ func LoadConfigFile(filename string) (cfg Config, err error) {
 	defer f.Close()
 
 	return cfg, toml.NewDecoder(f).Decode(&cfg)
+}
+
+func (cfg *Config) TelemetryEnabled() bool {
+	return cfg.Telemetry.Addr != ""
 }

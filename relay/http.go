@@ -32,6 +32,13 @@ type HTTP struct {
 	l       net.Listener
 
 	backends []*httpBackend
+
+	// number of total requests received by the HTTP relay
+	totalRequests float64
+	// number of failed requests received by the HTTP relay
+	failedRequests float64
+	// number of valid points received by the HTTP relay
+	receivedPoints float64
 }
 
 const (
@@ -110,8 +117,45 @@ func (h *HTTP) Stop() error {
 	return h.l.Close()
 }
 
+func (h *HTTP) TotalRequests() float64 {
+	return h.totalRequests
+}
+
+func (h *HTTP) FailedRequests() float64 {
+	return h.failedRequests
+}
+
+func (h *HTTP) ReceivedPoints() float64 {
+	return h.receivedPoints
+}
+
+func (h *HTTP) SentBytes() map[string]float64 {
+	ret := make(map[string]float64, len(h.backends))
+	for i := range h.backends {
+		ret[h.backends[i].name] = float64(h.backends[i].total)
+	}
+	return ret
+}
+
+func (h *HTTP) FailedBytes() map[string]float64 {
+	ret := make(map[string]float64, len(h.backends))
+	for i := range h.backends {
+		ret[h.backends[i].name] = float64(h.backends[i].failed)
+	}
+	return ret
+}
+
+func (h *HTTP) BufferedBytes() map[string]float64 {
+	ret := make(map[string]float64, len(h.backends))
+	for i := range h.backends {
+		ret[h.backends[i].name] = float64(h.backends[i].poster.pendingBytes())
+	}
+	return ret
+}
+
 func (h *HTTP) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
+	h.totalRequests++
 
 	if r.URL.Path == "/ping" && (r.Method == "GET" || r.Method == "HEAD") {
 			w.Header().Add("X-InfluxDB-Version", "relay")
@@ -121,6 +165,7 @@ func (h *HTTP) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	if r.URL.Path != "/write" {
 		jsonError(w, http.StatusNotFound, "invalid write endpoint")
+		h.failedRequests++
 		return
 	}
 
@@ -130,6 +175,7 @@ func (h *HTTP) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusNoContent)
 		} else {
 			jsonError(w, http.StatusMethodNotAllowed, "invalid write method")
+			h.failedRequests++
 		}
 		return
 	}
@@ -139,6 +185,7 @@ func (h *HTTP) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// fail early if we're missing the database
 	if queryParams.Get("db") == "" {
 		jsonError(w, http.StatusBadRequest, "missing parameter: db")
+		h.failedRequests++
 		return
 	}
 
@@ -152,6 +199,7 @@ func (h *HTTP) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		b, err := gzip.NewReader(r.Body)
 		if err != nil {
 			jsonError(w, http.StatusBadRequest, "unable to decode gzip body")
+			h.failedRequests++
 		}
 		defer b.Close()
 		body = b
@@ -162,6 +210,7 @@ func (h *HTTP) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		putBuf(bodyBuf)
 		jsonError(w, http.StatusInternalServerError, "problem reading request body")
+		h.failedRequests++
 		return
 	}
 
@@ -170,9 +219,11 @@ func (h *HTTP) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		putBuf(bodyBuf)
 		jsonError(w, http.StatusBadRequest, "unable to parse points")
+		h.failedRequests++
 		return
 	}
 
+	h.receivedPoints += float64(len(points))
 	outBuf := getBuf()
 	for _, p := range points {
 		if _, err = outBuf.WriteString(p.PrecisionString(precision)); err != nil {
@@ -189,6 +240,7 @@ func (h *HTTP) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		putBuf(outBuf)
 		jsonError(w, http.StatusInternalServerError, "problem writing points")
+		h.failedRequests++
 		return
 	}
 
@@ -209,12 +261,18 @@ func (h *HTTP) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		b := b
 		go func() {
 			defer wg.Done()
+			size := len(outBytes)
+			b.total += size
 			resp, err := b.post(outBytes, query, authHeader)
 			if err != nil {
+				b.failed += size
 				log.Printf("Problem posting to relay %q backend %q: %v", h.Name(), b.name, err)
 			} else {
 				if resp.StatusCode/100 == 5 {
 					log.Printf("5xx response for relay %q backend %q: %v", h.Name(), b.name, resp.StatusCode)
+				}
+				if resp.StatusCode/100 != 2 {
+					b.failed += size
 				}
 				responses <- resp
 			}
@@ -238,6 +296,7 @@ func (h *HTTP) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		case 4:
 			// user error
 			resp.Write(w)
+			h.failedRequests++
 			return
 
 		default:
@@ -246,6 +305,7 @@ func (h *HTTP) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	h.failedRequests++
 	// no successful writes
 	if errResponse == nil {
 		// failed to make any valid request...
@@ -287,6 +347,7 @@ func jsonError(w http.ResponseWriter, code int, message string) {
 
 type poster interface {
 	post([]byte, string, string) (*responseData, error)
+	pendingBytes() int
 }
 
 type simplePoster struct {
@@ -340,16 +401,22 @@ func (b *simplePoster) post(buf []byte, query string, auth string) (*responseDat
 	}
 
 	return &responseData{
-		ContentType:     resp.Header.Get("Conent-Type"),
-		ContentEncoding: resp.Header.Get("Conent-Encoding"),
+		ContentType:     resp.Header.Get("Content-Type"),
+		ContentEncoding: resp.Header.Get("Content-Encoding"),
 		StatusCode:      resp.StatusCode,
 		Body:            data,
 	}, nil
 }
 
+func (b* simplePoster) pendingBytes() int {
+	return 0
+}
+
 type httpBackend struct {
 	poster
 	name string
+	total int
+	failed int
 }
 
 func newHTTPBackend(cfg *HTTPOutputConfig) (*httpBackend, error) {
